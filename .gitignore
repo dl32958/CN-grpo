@@ -1,0 +1,19 @@
+# output files and logs
+# outputs/
+logs/
+slurm_logs/
+
+# job submission scripts
+*.sbatch
+run_*.sh
+
+# Python cache and logs
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+
+# temp files
+*.tmp
+*.swp
+*~

@@ -1,0 +1,8 @@
+model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft"
+data_path: "../datasets/raw/Multitarget-CONAN.csv"
+output_path: "outputs/results.csv"
+
+max_new_tokens: 80
+temperature: 0.7
+top_p: 0.9
+batch_size: 8

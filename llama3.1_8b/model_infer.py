@@ -28,7 +28,7 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
-    dtype=torch.bfloat16,
+    dtype=torch.bfloat16,  # for h200
     device_map="auto",
     trust_remote_code=True
 )
@@ -37,6 +37,7 @@ model.eval()
 
 # dataset
 df = pd.read_csv(DATA_PATH)
+# df = df.head(10)
 
 if "HATE_SPEECH" not in df.columns:
     raise ValueError("Dataset must contain column 'HATE_SPEECH'")
@@ -44,13 +45,30 @@ prompts = df["HATE_SPEECH"].tolist()
 responses = []
 
 prompts = [
-    (
-        "You are a helpful assistant that generates counter-speech to combat hate speech.\n"
-        "Generate a counter-speech to respond to the following hate message in a respectful and persuasive way:\n"
-        f"User: {text}\nAssistant:"
-    )
+    # (
+    #     "You are a helpful assistant that generates counter-speech to combat hate speech.\n"
+    #     "Generate a counter-speech to respond to the following hate message in a respectful and persuasive way:\n"
+    #     f"User: {text}\nAssistant:"
+    # )
+    f"You are a thoughtful assistant engaged in constructive discussions.\n\n"
+    f"The following message reflects a strong opinion or sentiment:\n{text}\n\n"
+    "Please provide a thoughtful, balanced response that offers a different perspective."
     for text in df["HATE_SPEECH"].tolist()
 ]
+
+def extract_response(full_output, original_prompt):
+    prompt_tokens = len(tokenizer.encode(original_prompt))
+    full_tokens = tokenizer.encode(full_output)
+    
+    if len(full_tokens) > prompt_tokens:
+        new_tokens = full_tokens[prompt_tokens:]
+        response = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        # clean protential prompt remnants
+        response = response.lstrip("':\"- ").strip()
+        return response.strip()
+    else:
+        return ""
 
 # batch generation
 def batch_generate(model, tokenizer, prompts, batch_size):
@@ -74,8 +92,11 @@ def batch_generate(model, tokenizer, prompts, batch_size):
             pad_token_id=tokenizer.eos_token_id
         )
 
-        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        batch_responses = [x.split("Assistant:")[-1].strip() for x in decoded]
+        decoded_texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        
+        batch_responses = [extract_response(decoded_text, prompt) 
+                          for decoded_text, prompt in zip(decoded_texts, batch_prompts)]
+
         responses.extend(batch_responses)
 
     return responses

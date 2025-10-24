@@ -1,5 +1,5 @@
 import pandas as pd
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.bleu_score import sentence_bleu, corpus_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
 from tqdm import tqdm
 import numpy as np
@@ -7,14 +7,11 @@ import yaml
 import os
 import json
 
-
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
-
 DATA_PATH = config["output_path"]
 
 df = pd.read_csv(DATA_PATH)
-
 if "GENERATED_COUNTER_SPEECH" not in df.columns:
     raise ValueError("Dataset must contain 'GENERATED_COUNTER_SPEECH' column for evaluation.")
 
@@ -44,8 +41,13 @@ for ref, hyp in tqdm(zip(refs, hyps), total=len(refs), desc="Evaluating"):
     rouge = scorer.score(ref, hyp)
     rougeL_scores.append(rouge['rougeL'].fmeasure)
 
+list_of_references = [[ref.split()] for ref in refs]
+hypotheses = [hyp.split() for hyp in hyps]
+corpus_bleu_score = corpus_bleu(list_of_references, hypotheses, smoothing_function=smooth)
+
 results = {
-    'BLEU': np.mean(bleu_scores),
+    'BLEU_sentence': np.mean(bleu_scores),
+    'BLEU_corpus': corpus_bleu_score,
     'ROUGE-L': np.mean(rougeL_scores),
     'avg_length': np.mean([len(hyp.split()) for hyp in hyps])
 }

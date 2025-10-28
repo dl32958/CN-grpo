@@ -1,53 +1,16 @@
-model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct"
-train_data_path: "../datasets/sft/train.jsonl"
-val_data_path: "../datasets/sft/val.jsonl"
-output_path: "outputs/sft_results.csv"
-
-training:
+sft:
+  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct"
+  train_data_path: "../datasets/processed/train.jsonl"
+  val_data_path: "../datasets/processed/val.jsonl"
+  test_data_path: "../datasets/processed/test.jsonl"
   output_dir: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft"
-  num_train_epochs: 3
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 1
-  gradient_accumulation_steps: 4
-  learning_rate: 2e-5
-  weight_decay: 0.01
-  warmup_ratio: 0.03
-  logging_steps: 10
-  eval_steps: 200
-  save_steps: 200
-  save_total_limit: 4
-  eval_strategy: "steps"
-  save_strategy: "steps"
-  load_best_model_at_end: true
-  # metric_for_best_model: "eval_loss"
-  # greater_is_better: false
-  report_to: "none"
-  remove_unused_columns: false
-  dataloader_pin_memory: true
 
-data:
-  max_length: 512
-  truncation: true
-  padding: "max_length"
-  shuffle: true
-
-generation:
-  max_new_tokens: 80
-  temperature: 0.7
-  top_p: 0.9
-  do_sample: true
-
-# LoRA configuration
-lora:
-  enabled: false
-  r: 16
-  alpha: 32
-  dropout: 0.1
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-
-compute:
-  fp16: false
-  bf16: true  # for h200 GPUs
-  gradient_checkpointing: true
-  dataloader_num_workers: 4
-  torch_compile: false   # accelerate forward pass
+prompts:
+  system: |-
+    You are a helpful, factual, and empathetic assistant.
+    Given a problematic claim from an online discussion, write a short, respectful reply
+    that reduces tension, corrects inaccuracies, and promotes inclusive norms.
+    Do not repeat slurs (paraphrase if needed). No safety disclaimers or "as an AI" statements.
+  user_template: |-
+    Reply constructively to this message from an online discussion:
+    {HATE_SPEECH}

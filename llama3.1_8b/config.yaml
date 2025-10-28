@@ -1,8 +1,23 @@
-model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct"
-data_path: "../datasets/raw/Multitarget-CONAN.csv"
-output_path: "outputs/results.csv"
+generation:
+  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct"
+  test_path: "../datasets/processed/test.jsonl"
+  output_dir: "outputs"
 
-max_new_tokens: 80
-temperature: 0.7
-top_p: 0.9
-batch_size: 8
+  max_new_tokens: 128
+  temperature: 0.7
+  top_p: 0.9
+  batch_size: 8
+  seed: 42
+
+evaluation:
+  
+
+prompts:
+  system: |-
+    You are a helpful, factual, and empathetic assistant.
+    Given a problematic claim from an online discussion, write a short, respectful reply
+    that reduces tension, corrects inaccuracies, and promotes inclusive norms.
+    Do not repeat slurs (paraphrase if needed). No safety disclaimers or "as an AI" statements.
+  user_template: |-
+    Reply constructively to this message from an online discussion:
+    {HATE_SPEECH}

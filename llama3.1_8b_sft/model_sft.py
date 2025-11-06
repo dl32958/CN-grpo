@@ -1,5 +1,5 @@
-# train_sft_hf.py  —— Supervised Fine-Tuning without TRL
-import json, yaml, torch
+import os, json, yaml, torch
+import pandas as pd
 from dataclasses import dataclass
 from typing import List, Dict, Any
 from datasets import Dataset
@@ -10,12 +10,13 @@ from transformers import (
 # ---------- load config ----------
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
+
 MODEL_PATH = config["sft"]["model_path"]
 TRAIN_PATH = config["sft"]["train_data_path"]
 VAL_PATH = config["sft"]["val_data_path"]
 OUTPUT_DIR = config["sft"]["output_dir"]
 SYSTEM_PROMPT = config["prompts"]["system"]
-USER_TEMPLATE = config["prompts"]["user_template"]
+USER_TEMPLATE = config["prompts"]["user"]
 
 # ---------- tokenizer & model ----------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
@@ -33,15 +34,22 @@ model = AutoModelForCausalLM.from_pretrained(
 model.config.use_cache = False
 model.config.pad_token_id = tokenizer.pad_token_id
 
-# ---------- load dataset ----------
-def read_jsonl(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+# ---------- load CSV datasets ----------
+def read_csv_records(path: str):
+    df = pd.read_csv(path)
+    need = ["HATE_SPEECH", "COUNTER_NARRATIVE"]
+    for col in need:
+        if col not in df.columns:
+            raise ValueError(f"Missing column: {col} in {path}")
+    df = df.dropna(subset=need)
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    return df.to_dict(orient="records")
 
-train_raw = read_jsonl(TRAIN_PATH)
-val_raw   = read_jsonl(VAL_PATH)
+train_raw = read_csv_records(TRAIN_PATH)
+val_raw = read_csv_records(VAL_PATH)
 
-
+# ---------- build chat-formatted text ----------
 def to_chat_text(ex: Dict[str, Any]) -> str:
     user_msg = USER_TEMPLATE.format(HATE_SPEECH=ex["HATE_SPEECH"])
     messages = [
@@ -52,17 +60,17 @@ def to_chat_text(ex: Dict[str, Any]) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
 
 train_ds = Dataset.from_list([{"text": to_chat_text(x)} for x in train_raw])
-val_ds   = Dataset.from_list([{"text": to_chat_text(x)} for x in val_raw])
+val_ds = Dataset.from_list([{"text": to_chat_text(x)} for x in val_raw])
 
 # ---------- completion-only data collator ----------
-# 不训练整个序列（包括 system 和 user 部分），只训练 assistant 回复部分
 @dataclass
 class CompletionOnlyCollatorPreferAssistant:
     tokenizer: Any
     max_length: int = 768
-    keep_min_context: int = 128  # 有余量时尽量保留这么多左侧上下文
+    keep_min_context: int = 128
 
     def __post_init__(self):
+        # use assistant empty reply prefix to locate the start of assistant segment
         prefix_text = self.tokenizer.apply_chat_template(
             [{"role": "assistant", "content": ""}],
             tokenize=False, add_generation_prompt=False
@@ -144,7 +152,7 @@ args = TrainingArguments(
     weight_decay=0.01,
     warmup_ratio=0.03,
     logging_steps=10,
-    eval_strategy="steps",
+    evaluation_strategy="steps",
     eval_steps=200,
     save_strategy="steps",
     save_steps=200,
@@ -153,12 +161,11 @@ args = TrainingArguments(
     bf16=True,
     gradient_checkpointing=True,
     report_to="none",
-    remove_unused_columns=False,    # 我们的 collator基于 "text"
-    # 添加一些有用的参数
+    remove_unused_columns=False,      # collator based on "text"
     metric_for_best_model="eval_loss",
     greater_is_better=False,
-    dataloader_pin_memory=True,     # 加速数据加载
-    dataloader_num_workers=2,       # 并行数据加载
+    dataloader_pin_memory=True,
+    dataloader_num_workers=2,
 )
 
 # ---------- trainer ----------
@@ -167,12 +174,10 @@ trainer = Trainer(
     args=args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
-    data_collator=collator,   # 关键：只训 assistant 段
+    data_collator=collator,
 )
 
-# 训练前检查一下数据
-print("Checking first training sample:")
-sample_batch = collator([train_ds[0]])
+# check
 print(f"Input shape: {sample_batch['input_ids'].shape}")
 print(f"Labels shape: {sample_batch['labels'].shape}")
 print(f"Non-masked labels: {(sample_batch['labels'][0] != -100).sum()}")

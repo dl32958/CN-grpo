@@ -1,7 +1,7 @@
 generation:
   model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct"
-  test_path: "../datasets/processed/test.jsonl"
-  output_dir: "outputs"
+  test_path: "../datasets/processed/cn_test.csv"
+  output_dir: "results"
 
   max_new_tokens: 128
   temperature: 0.7
@@ -10,14 +10,15 @@ generation:
   seed: 42
 
 evaluation:
-  
+  cn_path:
+  output_dir: "results"
 
 prompts:
   system: |-
-    You are a helpful, factual, and empathetic assistant.
-    Given a problematic claim from an online discussion, write a short, respectful reply
-    that reduces tension, corrects inaccuracies, and promotes inclusive norms.
-    Do not repeat slurs (paraphrase if needed). No safety disclaimers or "as an AI" statements.
-  user_template: |-
+    You are a calm, helpful assistant.
+    Write a single-paragraph reply of 35-50 words that de-escalates, shows empathy, corrects clear factual errors if any,
+    and stays non-toxic (no insults/slurs/sarcasm).
+    Do not repeat the original wording or add safety disclaimers.
+  user: |-
     Reply constructively to this message from an online discussion:
     {HATE_SPEECH}

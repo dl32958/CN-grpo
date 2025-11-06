@@ -1,6 +1,7 @@
-import os, json, yaml, argparse, math
+import os, yaml, argparse, math, csv, random
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Any, Iterable
+import numpy as np
 import torch
 import pandas as pd
 from tqdm import tqdm
@@ -8,10 +9,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Generate counter-narratives on test split")
+    p = argparse.ArgumentParser(description="Generate CN on test split (CSV)")
     p.add_argument("--limit", type=int, default=None, help="limit number of samples for quick run")
-    p.add_argument("--csv", action="store_true", help="export CSV (plus JSONL)")
     return p.parse_args()
+
 
 args = parse_args()
 
@@ -29,36 +30,22 @@ temperature = config["generation"]["temperature"]
 top_p = config["generation"]["top_p"]
 batch_size = config["generation"]["batch_size"]
 seed = config["generation"]["seed"]
-max_input_len = config["generation"].get("max_input_len", 512)
+max_input_len = 512
 
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
 
 
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    items = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if s:
-                items.append(json.loads(s))
-    return items
-
-def write_jsonl(path: str, rows: Iterable[Dict[str, Any]]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
 def chunk(lst: List[Any], n: int):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+
 def build_prompt_str(tokenizer, system_text: str, user_text: str) -> str:
     messages = [
         {"role": "system", "content": system_text},
-        {"role": "user", "content": user_text},
+        {"role": "user",   "content": user_text},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -68,11 +55,11 @@ tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.pad_token_id = tokenizer.eos_token_id
-tokenizer.padding_side = "right"
+tokenizer.padding_side = "left"
 
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     device_map="auto",
     trust_remote_code=True,
 )
@@ -80,15 +67,18 @@ model.config.use_cache = False
 model.config.pad_token_id = tokenizer.pad_token_id
 model.eval()
 
-# ---- load dataset ----
-records = load_jsonl(test_path)
+# ---- load CSV test set ----
+df = pd.read_csv(test_path)
 if args.limit:
-    records = records[:args.limit]
+    df = df.iloc[:args.limit].copy()
 
+if "HATE_SPEECH" not in df.columns:
+    raise ValueError("CSV must contain column 'HATE_SPEECH'.")
+
+# ---- build prompts ----
 prompts = []
-for rec in records:
-    hate_speech = rec["HATE_SPEECH"].strip()
-    user_text = user_template.format(HATE_SPEECH=hate_speech)
+for hs in df["HATE_SPEECH"].fillna("").astype(str).tolist():
+    user_text = user_template.format(HATE_SPEECH=hs.strip())
     prompt = build_prompt_str(tokenizer, system_prompt, user_text)
     prompts.append(prompt)
 
@@ -124,33 +114,16 @@ for batch in tqdm(list(chunk(prompts, batch_size)), desc="Generating"):
         text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
         generations.append(text)
 
-# ---- save results ----
+# ---- save results (CSV) ----
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-
-rows = []
-for rec, gen_text in zip(records, generations):
-    row = {
-        "INDEX": rec.get("INDEX"),
-        "HATE_SPEECH": rec["HATE_SPEECH"],
-        "COUNTER_NARRATIVE": rec.get("COUNTER_NARRATIVE"),
-        "TARGET": rec.get("TARGET"),
-        "VERSION": rec.get("VERSION"),
-        "GENERATED_COUNTER_SPEECH": gen_text,
-        "model_id": model_path,
-        "timestamp": timestamp,
-    }
-    rows.append(row)
-
 os.makedirs(output_dir, exist_ok=True)
-jsonl_path = os.path.join(output_dir, f"gen-results-{timestamp}.jsonl")
-write_jsonl(jsonl_path, rows)
 
-if args.csv:
-    df = pd.DataFrame(rows)
-    csv_path = os.path.join(output_dir, f"gen-results-{timestamp}.csv")
-    df.to_csv(csv_path, index=False)
+df_out = df.copy()
+df_out["GENERATED_CN"] = generations
 
-print(f"JSONL saved: {jsonl_path}")
-if args.csv:
-    print(f"CSV saved: {csv_path}")
-print(f"Total generations: {len(rows)}")
+csv_path = os.path.join(output_dir, f"cn-gen-{timestamp}.csv")
+
+df_out.to_csv(csv_path, index=False)
+print(f"CSV saved: {csv_path}")
+
+print(f"Total generations: {len(df_out)}")

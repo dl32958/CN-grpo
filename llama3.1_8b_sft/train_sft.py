@@ -5,14 +5,15 @@ from transformers import (
 )
 from trl import SFTTrainer
 
-
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
-MODEL_PATH = config["model_path"]
-TRAIN_PATH = config["train_data_path"]
-VAL_PATH = config["val_data_path"]
-OUTPUT_DIR = config["output_dir"]
+MODEL_PATH = config["sft"]["model_path"]
+TRAIN_PATH = config["sft"]["train_data_path"]
+VAL_PATH = config["sft"]["val_data_path"]
+OUTPUT_DIR = config["sft"]["output_dir"]
+SYSTEM_PROMPT = config["prompts"]["system"]
+USER_TEMPLATE = config["prompts"]["user_template"]
 
 # tokenizer & model
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
@@ -24,7 +25,7 @@ tokenizer.model_max_length = 512
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
-    dtype=torch.bfloat16,  # for h200
+    dtype=torch.bfloat16,
     trust_remote_code=True
 )
 model.config.use_cache = False
@@ -41,20 +42,10 @@ val_raw = load_data(VAL_PATH)
 train_ds = Dataset.from_list(train_raw)
 val_ds = Dataset.from_list(val_raw)
 
-SYSTEM = (
-"You are a helpful, factual, and empathetic assistant. "
-"Given a problematic claim from an online discussion, write a short, respectful reply "
-"that reduces tension, corrects inaccuracies, and promotes inclusive norms. "
-"Do not repeat slurs (paraphrase if needed). No safety disclaimers or 'as an AI' statements. "
-)
-
 def formatting_func(example):
-    user_msg = (
-        "Reply constructively to this message from an online discussion:\n"
-        f"{example['HATE_SPEECH']}"
-    )
+    user_msg = USER_TEMPLATE.format(HATE_SPEECH=example["HATE_SPEECH"])
     messages = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
         {"role": "assistant", "content": example["COUNTER_NARRATIVE"]},
     ]
@@ -81,7 +72,7 @@ training_args = TrainingArguments(
     save_steps=200,
     save_total_limit=4,
     load_best_model_at_end=True,
-    bf16=True,   # H200
+    bf16=True,
     gradient_checkpointing=True,
     report_to="none",
     remove_unused_columns=False,  # chat text won't lose columns
@@ -95,6 +86,7 @@ trainer = SFTTrainer(
     train_dataset=train_ds,
     eval_dataset=val_ds,
     formatting_func=formatting_func,
+    max_seq_length=tokenizer.model_max_length,
 )
 
 trainer.train()
@@ -102,3 +94,5 @@ trainer.train()
 # save model
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
+
+print(f"Training completed! Model saved to {OUTPUT_DIR}")

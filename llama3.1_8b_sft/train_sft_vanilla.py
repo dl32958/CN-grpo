@@ -23,7 +23,7 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.pad_token_id = tokenizer.eos_token_id
 tokenizer.padding_side = "right"
-tokenizer.model_max_length = 512
+tokenizer.model_max_length = 768
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
@@ -43,7 +43,7 @@ val_raw   = read_jsonl(VAL_PATH)
 
 
 def to_chat_text(ex: Dict[str, Any]) -> str:
-    user_msg = USER_TEMPLATE.format(hate_speech=ex["HATE_SPEECH"])
+    user_msg = USER_TEMPLATE.format(HATE_SPEECH=ex["HATE_SPEECH"])
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
@@ -55,54 +55,83 @@ train_ds = Dataset.from_list([{"text": to_chat_text(x)} for x in train_raw])
 val_ds   = Dataset.from_list([{"text": to_chat_text(x)} for x in val_raw])
 
 # ---------- completion-only data collator ----------
+# 不训练整个序列（包括 system 和 user 部分），只训练 assistant 回复部分
 @dataclass
-class CompletionOnlyCollator:
-    tokenizer: AutoTokenizer
-    max_length: int
+class CompletionOnlyCollatorPreferAssistant:
+    tokenizer: Any
+    max_length: int = 768
+    keep_min_context: int = 128  # 有余量时尽量保留这么多左侧上下文
 
     def __post_init__(self):
-        # 用"空 assistant"生成前缀，定位回复起点
         prefix_text = self.tokenizer.apply_chat_template(
-            [{"role":"assistant","content":""}],
+            [{"role": "assistant", "content": ""}],
             tokenize=False, add_generation_prompt=False
         )
-        self.prefix_ids = self.tokenizer(prefix_text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
-        print(f"Assistant prefix pattern: {self.prefix_ids}")  # 调试信息
+        self.prefix_ids = self.tokenizer(
+            prefix_text, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"][0].tolist()
 
-    def _find_subseq(self, seq, subseq):
+    @staticmethod
+    def _find_subseq_start(seq: List[int], subseq: List[int]) -> int:
         L, l = len(seq), len(subseq)
         for i in range(0, L - l + 1):
             if seq[i:i+l] == subseq:
-                return i + l
-        return None
+                return i
+        return -1
 
     def __call__(self, features: List[Dict[str, Any]]):
         texts = [f["text"] for f in features]
-        enc = self.tokenizer(
-            texts, padding=True, truncation=True,
-            max_length=self.max_length, return_tensors="pt"
-        )
-        input_ids = enc["input_ids"]
-        labels = input_ids.clone()
+        batch_ids, batch_labels = [], []
 
-        # 先把 padding 置为 -100
-        labels[enc["attention_mask"] == 0] = -100
+        for text in texts:
+            full_ids = self.tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"]
+            if isinstance(full_ids[0], list):
+                full_ids = full_ids[0]
 
-        for i in range(input_ids.size(0)):
-            ids = input_ids[i].tolist()
-            start = self._find_subseq(ids, self.prefix_ids)
-            if start is None:
-                # 找不到就保守处理：除 padding 外全部 mask（防止错误监督）
-                print(f"Warning: Could not find assistant prefix in sample {i}")  # 调试
-                labels[i, labels[i] != -100] = -100
+            pos = self._find_subseq_start(full_ids, self.prefix_ids)
+            assistant_start_full = (pos + len(self.prefix_ids)) if pos != -1 else max(0, len(full_ids) - self.max_length)
+            assistant_end_full = len(full_ids)
+            assistant_len = assistant_end_full - assistant_start_full
+
+            if len(full_ids) <= self.max_length:
+                window_start = 0
             else:
-                # 只让 assistant 段参与 loss
-                labels[i, :start] = -100
+                left_budget = self.max_length - assistant_len
+                if left_budget <= 0:
+                    window_start = assistant_end_full - self.max_length
+                else:
+                    keep_left = min(self.keep_min_context, left_budget)
+                    window_start = max(0, assistant_start_full - keep_left)
+                    if assistant_end_full - window_start > self.max_length:
+                        window_start = assistant_end_full - self.max_length
 
-        enc["labels"] = labels
-        return enc
+            window_ids = full_ids[window_start:assistant_end_full]
+            start_in_window = max(0, assistant_start_full - window_start)
 
-collator = CompletionOnlyCollator(tokenizer, tokenizer.model_max_length)
+            labels = [-100] * len(window_ids)
+            for j in range(start_in_window, len(window_ids)):
+                labels[j] = window_ids[j]
+
+            batch_ids.append(window_ids)
+            batch_labels.append(labels)
+
+        B = len(batch_ids)
+        maxL = max(len(x) for x in batch_ids)
+        pad_id = self.tokenizer.pad_token_id
+
+        input_ids = torch.full((B, maxL), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((B, maxL), dtype=torch.long)
+        labels = torch.full((B, maxL), -100, dtype=torch.long)
+
+        for i, ids in enumerate(batch_ids):
+            L = len(ids)
+            input_ids[i, :L] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, :L] = 1
+            labels[i, :L] = torch.tensor(batch_labels[i], dtype=torch.long)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+collator = CompletionOnlyCollatorPreferAssistant(tokenizer, tokenizer.model_max_length, keep_min_context=128)
 
 # ---------- training args ----------
 args = TrainingArguments(
@@ -115,7 +144,7 @@ args = TrainingArguments(
     weight_decay=0.01,
     warmup_ratio=0.03,
     logging_steps=10,
-    evaluation_strategy="steps",
+    eval_strategy="steps",
     eval_steps=200,
     save_strategy="steps",
     save_steps=200,

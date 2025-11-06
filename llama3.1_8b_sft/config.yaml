@@ -14,3 +14,7 @@ prompts:
   user_template: |-
     Reply constructively to this message from an online discussion:
     {HATE_SPEECH}
+
+generation:
+
+evaluation:

@@ -10,7 +10,8 @@ generation:
   seed: 42
 
 evaluation:
-  cn_path:
+  evaluator_path: "../evaluator.py"
+  cn_path: "results/cn-gen-20251106_1655.csv"
   output_dir: "results"
 
 prompts:

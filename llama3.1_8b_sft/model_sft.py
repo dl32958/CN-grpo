@@ -152,7 +152,7 @@ args = TrainingArguments(
     weight_decay=0.01,
     warmup_ratio=0.03,
     logging_steps=10,
-    evaluation_strategy="steps",
+    eval_strategy="steps",
     eval_steps=200,
     save_strategy="steps",
     save_steps=200,
@@ -178,6 +178,7 @@ trainer = Trainer(
 )
 
 # check
+sample_batch = collator([train_ds[0]])
 print(f"Input shape: {sample_batch['input_ids'].shape}")
 print(f"Labels shape: {sample_batch['labels'].shape}")
 print(f"Non-masked labels: {(sample_batch['labels'][0] != -100).sum()}")

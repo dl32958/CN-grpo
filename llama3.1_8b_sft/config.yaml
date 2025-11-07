@@ -17,6 +17,7 @@ generation:
   seed: 42
 
 evaluation:
+  evaluator_path: "../evaluator.py"
   cn_path:
   output_dir: "results"
 

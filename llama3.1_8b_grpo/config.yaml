@@ -1,6 +1,14 @@
-generation:
-  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct"
+grpo:
+  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft"
+  train_data_path: "../datasets/processed/cn_train.csv"
+  val_data_path: "../datasets/processed/cn_val.csv"
   test_data_path: "../datasets/processed/cn_test.csv"
+  output_dir: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft-grpo"
+  evaluator_path: "../evaluator.py"
+
+generation:
+  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft-grpo"
+  test_path: "../datasets/processed/cn_test.csv"
   output_dir: "results"
 
   max_new_tokens: 128
@@ -11,7 +19,7 @@ generation:
 
 evaluation:
   evaluator_path: "../evaluator.py"
-  cn_path: "results/cn-gen-20251114_2322.csv"
+  cn_path:
   output_dir: "results"
 
 prompts:

@@ -1,4 +1,4 @@
-import os, yaml, argparse, math, csv, random
+import os, yaml, argparse, math, csv, random, re
 from datetime import datetime
 from typing import List, Dict, Any, Iterable
 import numpy as np
@@ -13,28 +13,27 @@ def parse_args():
     p.add_argument("--limit", type=int, default=None, help="limit number of samples for quick run")
     return p.parse_args()
 
-
 args = parse_args()
 
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
-model_path = config["generation"]["model_path"]
-test_path = config["generation"]["test_path"]
-output_dir = config["generation"]["output_dir"]
+MODEL_PATH = config["generation"]["model_path"]
+TEST_DATA_PATH = config["generation"]["test_data_path"]
+OUTPUT_DIR = config["generation"]["output_dir"]
 
-system_prompt = config["prompts"]["system"]
-user_template = config["prompts"]["user"]
-max_new_tokens = config["generation"]["max_new_tokens"]
-temperature = config["generation"]["temperature"]
-top_p = config["generation"]["top_p"]
-batch_size = config["generation"]["batch_size"]
-seed = config["generation"]["seed"]
-max_input_len = 512
+SYSTEM_PROMPT = config["prompts"]["system"]
+USER_TEMPLATE = config["prompts"]["user"]
+MAX_NEW_TOKENS = config["generation"]["max_new_tokens"]
+TEMPERATURE = config["generation"]["temperature"]
+TOP_P = config["generation"]["top_p"]
+BATCH_SIZE = config["generation"]["batch_size"]
+MAX_INPUT_LEN = 512
 
-random.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
+SEED = config["generation"]["seed"]
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 
 def chunk(lst: List[Any], n: int):
@@ -47,18 +46,49 @@ def build_prompt_str(tokenizer, system_text: str, user_text: str) -> str:
         {"role": "system", "content": system_text},
         {"role": "user",   "content": user_text},
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+# extract CN from response
+def extract_cn(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+
+    s = text.strip()
+    if not s:
+        return s
+
+    lower = s.lower()
+
+    pat = "assistant\n"
+    idx = lower.rfind(pat)
+    if idx != -1:
+        s = s[idx + len(pat):]
+        s = s.lstrip(" .,:;!?\n\"'""''")
+        return s.strip()
+
+    parts = [p.strip() for p in re.split(r"\n\s*\n", s) if p.strip()]
+    if not parts:
+        parts = [p.strip() for p in s.split("\n") if p.strip()]
+
+    if parts:
+        return parts[-1]
+    else:
+        return s
 
 
 # ---- model & tokenizer ----
-tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.pad_token_id = tokenizer.eos_token_id
 tokenizer.padding_side = "left"
 
 model = AutoModelForCausalLM.from_pretrained(
-    model_path,
+    MODEL_PATH,
     dtype=torch.bfloat16,
     device_map="auto",
     trust_remote_code=True,
@@ -68,7 +98,7 @@ model.config.pad_token_id = tokenizer.pad_token_id
 model.eval()
 
 # ---- load CSV test set ----
-df = pd.read_csv(test_path)
+df = pd.read_csv(TEST_DATA_PATH)
 if args.limit:
     df = df.iloc[:args.limit].copy()
 
@@ -78,29 +108,29 @@ if "HATE_SPEECH" not in df.columns:
 # ---- build prompts ----
 prompts = []
 for hs in df["HATE_SPEECH"].fillna("").astype(str).tolist():
-    user_text = user_template.format(HATE_SPEECH=hs.strip())
-    prompt = build_prompt_str(tokenizer, system_prompt, user_text)
+    user_text = USER_TEMPLATE.format(HATE_SPEECH=hs.strip())
+    prompt = build_prompt_str(tokenizer, SYSTEM_PROMPT, user_text)
     prompts.append(prompt)
 
 # ---- generation ----
 generations = []
 
-for batch in tqdm(list(chunk(prompts, batch_size)), desc="Generating"):
+for batch in tqdm(list(chunk(prompts, BATCH_SIZE)), desc="Generating"):
     encodings = tokenizer(
         batch,
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=max_input_len,
+        max_length=MAX_INPUT_LEN,
     )
     encodings = {k: v.to(model.device) for k, v in encodings.items()}
 
     with torch.no_grad():
         outputs = model.generate(
             **encodings,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            top_p=TOP_P,
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True,
@@ -111,17 +141,21 @@ for batch in tqdm(list(chunk(prompts, batch_size)), desc="Generating"):
 
     for i, input_len in enumerate(input_lens):
         generated_ids = sequences[i][input_len:]
-        text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        generations.append(text)
+        raw_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        extracted_cn = extract_cn(raw_text)
+        generations.append(extracted_cn)
+
+# for i, cn in enumerate(generations[:50]):
+#     print(f"{i} {cn}")
 
 # ---- save results (CSV) ----
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-os.makedirs(output_dir, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 df_out = df.copy()
 df_out["GENERATED_CN"] = generations
 
-csv_path = os.path.join(output_dir, f"cn-gen-{timestamp}.csv")
+csv_path = os.path.join(OUTPUT_DIR, f"cn-gen-{timestamp}.csv")
 
 df_out.to_csv(csv_path, index=False)
 print(f"CSV saved: {csv_path}")

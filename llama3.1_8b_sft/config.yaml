@@ -7,7 +7,7 @@ sft:
 
 generation:
   model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft"
-  test_path: "../datasets/processed/cn_test.csv"
+  test_data_path: "../datasets/processed/cn_test.csv"
   output_dir: "results"
 
   max_new_tokens: 128
@@ -18,7 +18,7 @@ generation:
 
 evaluation:
   evaluator_path: "../evaluator.py"
-  cn_path:
+  cn_path: "results/cn-gen-20251106_2357.csv"
   output_dir: "results"
 
 prompts:

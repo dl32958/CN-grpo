@@ -11,13 +11,15 @@ import yaml
 
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     get_linear_schedule_with_warmup,
 )
+import argparse
+
 
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -34,16 +36,28 @@ USER_TEMPLATE = config["prompts"]["user"]
 
 os.makedirs(GRPO_OUTPUT_DIR, exist_ok=True)
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--resume_dir",
+        type=str,
+        default="",
+        help="resume checkpoint path",
+    )
+    return parser.parse_args()
+
+args = parse_args()
+RESUME_DIR = args.resume_dir
+
 sys.path.append(os.path.dirname(EVALUATOR_PATH))
 from evaluator import (
     CounterNarrativeEvaluator,
-    OVERALL_WEIGHTS,
-    DIVERSITY_WEIGHTS,
-    PERSUASIVENESS_WEIGHTS,
+    EVALUATION_WEIGHTS,
 )
 
 # Parameters
 NUM_EPOCHS = 5
+# effective_batch_size = batch_size * K * grad_accum
 BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16
 NUM_SAMPLES_PER_PROMPT = 4  # K
@@ -64,14 +78,12 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 set_seed(SEED)
 
-# set up cuda
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available! This code requires CUDA to run.")
 device = torch.device("cuda")
 
 # 1. Load tokenizer and model
 def load_models_and_tokenizer():
-    # tokenizer
     tokenizer = AutoTokenizer.from_pretrained(SFT_MODEL_PATH)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -79,7 +91,7 @@ def load_models_and_tokenizer():
     # policy model
     policy_model = AutoModelForCausalLM.from_pretrained(
         SFT_MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": device},
     )
     policy_model.gradient_checkpointing_enable()
@@ -88,7 +100,7 @@ def load_models_and_tokenizer():
     # reference model
     ref_model = AutoModelForCausalLM.from_pretrained(
         SFT_MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": device},
     )
     ref_model.eval()
@@ -111,22 +123,28 @@ def build_chat_prompt(hate_speech, tokenizer) -> str:
     )
     return prompt_text
 
-# 3. Dataset & DataLoader
+# 3. ds & dataLoader
 class HateSpeechDataset(Dataset):
     def __init__(self, csv_path: str):
         df = pd.read_csv(csv_path)
         self.hates = df["HATE_SPEECH"].astype(str).tolist()
+        self.gts = df["COUNTER_NARRATIVE"].astype(str).tolist()
 
     def __len__(self):
         return len(self.hates)
 
     def __getitem__(self, idx):
-        hs = self.hates[idx]
-        return {"hate_speech": hs}
+        return {
+            "hate_speech": self.hates[idx],
+            "ground_truth": self.gts[idx],
+        }
 
 def build_dataloaders():
-    train_dataset = HateSpeechDataset(TRAIN_PATH).head(100)  # for test
-    val_dataset = HateSpeechDataset(VAL_PATH).head(20)
+    train_dataset = HateSpeechDataset(TRAIN_PATH)
+    val_dataset = HateSpeechDataset(VAL_PATH)
+
+    # train_dataset = Subset(HateSpeechDataset(TRAIN_PATH), list(range(100)))
+    # val_dataset = Subset(HateSpeechDataset(VAL_PATH), list(range(20)))
 
     train_loader = DataLoader(
         train_dataset,
@@ -143,92 +161,99 @@ def build_dataloaders():
     print(f"Train size: {len(train_dataset)} | Val size: {len(val_dataset)}")
     return train_loader, val_loader
 
-# 4. Evaluator & reward wrapper
+# 4. Evaluator (CounterNarrativeEvaluator) & reward wrapper
 def load_evaluator():
     evaluator = CounterNarrativeEvaluator()
     return evaluator
 
-
-"""
-现在 evaluator 里的 diversity 本质上是“这批句子的整体平均多样性”；在 GRPO 训练代码里，我们对每个 HS 的 K 条候选算出一个组内 diversity，
-再把这个常数加到每个 reward 上。但因为 advantage 是在组内做 mean-center，diversity 这一块会被完全抵消，所以目前 diversity 只影响 
-offline evaluation，不影响 RL 更新。
-"""
-def compute_sample_rewards(
-    evaluator: CounterNarrativeEvaluator,
-    hate_speech_list: List[str],
-    cn_list: List[str],
-) -> np.ndarray:
-    """
-    use evaluator's internal functions to calcuate each sample's reward (0-1)
-    """
+def compute_sample_rewards(evaluator: CounterNarrativeEvaluator, hate_speech_list, cn_list, gt_list) -> np.ndarray:
+    """use evaluator's internal functions to calcuate each sample's reward (0-1)"""
     hs = [str(x) if x is not None else "" for x in hate_speech_list]
     cn = [str(x) if x is not None else "" for x in cn_list]
+    gt = [str(x) if x is not None else "" for x in gt_list]
 
-    # 1. relevance
-    rel_scores, _ = evaluator._compute_relevance(hs, cn, batch_size=16)
+    if not (len(hs) == len(cn) == len(gt)):
+        raise ValueError(
+            f"Length mismatch in compute_sample_rewards: "
+            f"hs={len(hs)}, cn={len(cn)}, gt={len(gt)}"
+        )
 
-    # 2. toxicity & civility
-    tox_raw, civility = evaluator._compute_toxicity(cn)
-    safe_scores = 1.0 - tox_raw
+    n = len(cn)
 
-    # 3. length adherence
-    _, lengths = evaluator._compute_length(cn)
-    len_ok = ((lengths >= 35) & (lengths <= 50)).astype(float)
+    # safety
+    scorer = evaluator._PerspectiveScorer(evaluator.perspective_api_key)
+    tox_raw = scorer.score_list(cn)  # [N]
+    safety = 1.0 - tox_raw   # [N]
 
-    # 4. stance opposition
-    stance_scores = evaluator._compute_stance_opposition(hs, cn, batch_size=16)
-
-    # 5. answer quality (fluency + acceptability)
-    answer_quality = evaluator._compute_answer_quality(cn, batch_size=8)
-
-    # 6. diversity（全局一个分数，广播到每个样本）
-    div_res = evaluator._compute_diversity(
+    # refutation: MNLI contradiction prob
+    enc = evaluator.refutation_tokenizer(
+        hs,
         cn,
-        sample_k=min(20, max(1, len(cn) - 1)),
-        weights=DIVERSITY_WEIGHTS,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    ).to(evaluator.device)
+
+    with torch.inference_mode():
+        prob = torch.softmax(evaluator.refutation_model(**enc).logits, dim=-1)
+        refutation = prob[:, evaluator._contradiction_id].detach().cpu().numpy()  # [N]
+
+    # align GT: SBERT + BertScore
+    sbert_vec, _ = evaluator._compute_sbert_cos(cn, gt, batch_size=64)   # [N]
+    bert_f1 = evaluator._compute_bertscore(cn, gt)  # [N]
+
+    align_w = EVALUATION_WEIGHTS["sub_metrics"]["align_gt"]
+    align_gt_scores = (
+        align_w["sbert_cosine"] * sbert_vec +
+        align_w["bertscore_f1"] * bert_f1
+    )  # [N]
+
+    # language quality
+    lengths = np.fromiter(
+        (len(evaluator._word_re.findall(t)) for t in cn),
+        dtype=int,
     )
-    div_score = div_res["div_score"]
-    div_vec = np.full(len(cn), div_score, dtype=np.float32)
+    wc_score = CounterNarrativeEvaluator.score_wordcount(
+        lengths,
+        full_lo=35,
+        full_hi=50,
+        left_tol=20,
+        right_tol=20,
+    )   # [N]
 
-    # 7. per-sample persuasiveness
-    w_stance, w_civ, w_ans = PERSUASIVENESS_WEIGHTS
-    pers = np.clip(
-        w_stance * stance_scores +
-        w_civ * civility +
-        w_ans * answer_quality,
-        0.0, 1.0,
-    )
+    ppl_log = evaluator._compute_fluency(cn, batch_size=8)
+    ppl_log_clipped = np.maximum(ppl_log, 0.0)
+    fluency_arr = 1.0 / (1.0 + ppl_log_clipped)  # [N]
 
-    # 8. overall per-sample reward
-    w_rel = OVERALL_WEIGHTS["relevance"]
-    w_div = OVERALL_WEIGHTS["diversity"]
-    w_len = OVERALL_WEIGHTS["length"]
-    w_tox = OVERALL_WEIGHTS["toxicity"]
-    w_pers = OVERALL_WEIGHTS["persuasiveness"]
+    gramm_arr = evaluator._compute_cola(cn, batch_size=16)  # [N]
 
+    lang_w = EVALUATION_WEIGHTS["sub_metrics"]["language"]
+    language_scores = (
+        lang_w["length_score"] * wc_score +
+        lang_w["fluency_score"] * fluency_arr +
+        lang_w["gramm_score"] * gramm_arr
+    )  # [N]
+
+    # final rewards
+    cross_weights = EVALUATION_WEIGHTS["cross_category"]
     rewards = (
-        w_rel * rel_scores +
-        w_div * div_vec +
-        w_len * len_ok +
-        w_tox * safe_scores +
-        w_pers * pers
+        cross_weights["safety"] * safety +
+        cross_weights["refutation"] * refutation +
+        cross_weights["align_gt"] * align_gt_scores +
+        cross_weights["language"] * language_scores
     )
 
     rewards = np.clip(rewards, 0.0, 1.0).astype(np.float32)
     return rewards
 
-# 5. generate_cn function and logprob + KL
+
+# 5. helper fns (generate CN & calculate log probs + kl)
 @torch.no_grad()
-def generate_responses_for_hs(
-    hate_speech: str,
-    tokenizer,
-    policy_model,
-    num_samples: int = NUM_SAMPLES_PER_PROMPT,
-) -> Dict[str, Any]:
+def generate_responses_for_hs(hate_speech, tokenizer, policy_model, num_samples = NUM_SAMPLES_PER_PROMPT):
     """
     For each HS, use policy_model to generate K CNs.
-    returns:
+    Returns:
       - responses_text: List[str]
       - sequences_ids: torch.LongTensor [num_samples, seq_len] (prompt + CN)
       - prompt_len: int
@@ -239,25 +264,21 @@ def generate_responses_for_hs(
         return_tensors="pt",
         add_special_tokens=False,
     )
-    input_ids = enc["input_ids"].to(device)
+    input_ids = enc["input_ids"].to(device)  # [1, L]
     attention_mask = enc["attention_mask"].to(device)
 
     prompt_len = input_ids.shape[1]
 
-    # Expand for multiple generations
-    input_ids_expanded = input_ids.expand(num_samples, -1)
-    attn_expanded = attention_mask.expand(num_samples, -1)
-
     outputs = policy_model.generate(
-        input_ids=input_ids_expanded,
-        attention_mask=attn_expanded,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=MAX_NEW_TOKENS,
         do_sample=True,
         temperature=GEN_TEMP,
         top_p=GEN_TOP_P,
-        num_return_sequences=num_samples,
+        num_return_sequences=num_samples,          # control K
         pad_token_id=tokenizer.eos_token_id,
-    )
+    )  # [K, L_total]
 
     sequences_ids = outputs
     responses_text = []
@@ -273,13 +294,7 @@ def generate_responses_for_hs(
     }
 
 
-def compute_logprobs_and_kl(
-    sequences_ids: torch.LongTensor,
-    prompt_len: int,
-    tokenizer,
-    policy_model,
-    ref_model,
-) -> Dict[str, torch.Tensor]:
+def compute_logprobs_and_kl(sequences_ids: torch.LongTensor, prompt_len, tokenizer, policy_model, ref_model) -> Dict[str, torch.Tensor]:
     """
     For a batch of sequences (prompt + CN):
     - Calculate policy sequence-level logprob (generation part only)
@@ -303,7 +318,7 @@ def compute_logprobs_and_kl(
         )
         logits_ref = outputs_ref.logits  # [B, L, V]
 
-    # shift 1: logits[:, :-1] predicts targets = input_ids[:, 1:]
+    # shift one token: logits[:, :-1] predicts targets = input_ids[:, 1:]
     logits_pol = logits_policy[:, :-1, :]
     logits_ref = logits_ref[:, :-1, :]
     targets = sequences_ids[:, 1:]
@@ -312,14 +327,14 @@ def compute_logprobs_and_kl(
     logprobs_ref = torch.log_softmax(logits_ref, dim=-1)
     probs_pol = torch.softmax(logits_pol, dim=-1)
 
-    # calculate only for generation part: first generated token's logits index = prompt_len - 1
-    gen_start = prompt_len - 1
+    # generation part only
+    gen_start = prompt_len - 1  # first generated token's logits index
     gen_logprobs_pol = logprobs_pol[:, gen_start:, :]     # [B, gen_L, V]
     gen_logprobs_ref = logprobs_ref[:, gen_start:, :]     # [B, gen_L, V]
     gen_probs_pol = probs_pol[:, gen_start:, :]           # [B, gen_L, V]
     gen_targets = targets[:, gen_start:]                  # [B, gen_L]
 
-    # sequence logprob (only for actually generated tokens)
+    # sequence logprob (policy)
     token_logprob_pol = gen_logprobs_pol.gather(
         2, gen_targets.unsqueeze(-1)
     ).squeeze(-1)                                         # [B, gen_L]
@@ -334,7 +349,7 @@ def compute_logprobs_and_kl(
 
     return {"seq_logprob": seq_logprob, "kl_seq": kl_seq}
 
-# 6. Optimizer & Scheduler
+# 6. optimizer & lr-scheduler
 def build_optimizer_and_scheduler(policy_model, train_loader_len: int):
     optimizer = torch.optim.AdamW(
         policy_model.parameters(),
@@ -357,37 +372,31 @@ def build_optimizer_and_scheduler(policy_model, train_loader_len: int):
     return optimizer, scheduler
 
 # 7. evlaute val set
-def evaluate_on_val(
-    val_loader,
-    tokenizer,
-    policy_model,
-    evaluator,
-    num_batches: int = 50,
-) -> float:
-    """
-    在 val set 上跑一小部分 batch，估计一下平均 reward。
-    为了省时间 & API 调用，默认只跑 num_batches 条。
-    """
+def evaluate_on_val(val_loader, tokenizer, policy_model, evaluator, num_batches = 50):
+    """run small batch on val set to elimiate loss"""
     policy_model.eval()
-    all_rewards: List[float] = []
+    all_rewards = []
 
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             if i >= num_batches:
                 break
             hs = batch["hate_speech"][0]
+            gt = batch["ground_truth"][0]
+
             gen_res = generate_responses_for_hs(
                 hs,
                 tokenizer=tokenizer,
                 policy_model=policy_model,
                 num_samples=1,
             )
-            responses = gen_res["responses_text"]
+            responses = gen_res["responses_text"]  # len = 1
 
             rewards = compute_sample_rewards(
                 evaluator=evaluator,
                 hate_speech_list=[hs],
                 cn_list=responses,
+                gt_list=[gt],
             )
             all_rewards.append(float(rewards[0]))
 
@@ -396,12 +405,77 @@ def evaluate_on_val(
         return 0.0
     return float(np.mean(all_rewards))
 
-# 8. training loop
+
+# checkpoint
+def save_training_state(save_dir, epoch, global_step, policy_model, optimizer, lr_scheduler):
+    """
+    保存当前 epoch 结束时的训练状态到 save_dir/trainer_state.pt
+    epoch: 下次要从哪个 epoch 开始（这里通常传 epoch+1）
+    """
+    state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": policy_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": lr_scheduler.state_dict(),
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all(),
+        },
+    }
+    torch.save(state, os.path.join(save_dir, "trainer_state.pt"))
+    print(f"[Checkpoint] trainer_state saved to {save_dir}")
+
+
+def load_training_state_if_any(resume_dir, policy_model, optimizer, lr_scheduler,):
+    """
+    如果提供了 resume_dir 且里面存在 trainer_state.pt，就加载；
+    否则返回 (start_epoch=0, global_step=0)，表示从头训练
+    """
+    if not resume_dir:
+        print("[Resume] No resume_dir provided, start from scratch.")
+        return 0, 0
+
+    state_path = os.path.join(resume_dir, "trainer_state.pt")
+    if not os.path.exists(state_path):
+        print(f"[Resume] {state_path} not found, start from scratch.")
+        return 0, 0
+
+    print(f"[Resume] Loading training state from {state_path}")
+    ckpt = torch.load(state_path, map_location=device)
+
+    policy_model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    lr_scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+    rng = ckpt.get("rng_state", None)
+    if rng is not None:
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"])
+        torch.cuda.set_rng_state_all(rng["cuda"])
+
+    start_epoch = ckpt.get("epoch", 0)
+    global_step = ckpt.get("global_step", 0)
+
+    print(f"[Resume] Next epoch index = {start_epoch}, global_step = {global_step}")
+    return start_epoch, global_step
+
+
+
+# ============= Train Loop ============
 tokenizer, policy_model, ref_model = load_models_and_tokenizer()
 train_loader, val_loader = build_dataloaders()
 evaluator = load_evaluator()
 optimizer, lr_scheduler = build_optimizer_and_scheduler(
     policy_model, len(train_loader)
+)
+
+# try to resume from checkpoint (--resume_dir)
+start_epoch, global_step = load_training_state_if_any(
+    RESUME_DIR, policy_model, optimizer, lr_scheduler
 )
 
 # sanity check on val reward
@@ -410,9 +484,7 @@ init_val_reward = evaluate_on_val(
 )
 print(f"Initial val reward estimate (~5 samples): {init_val_reward:.4f}")
 
-global_step = 0
-
-for epoch in range(NUM_EPOCHS):
+for epoch in range(start_epoch, NUM_EPOCHS):
     policy_model.train()
     running_loss = 0.0
 
@@ -422,29 +494,34 @@ for epoch in range(NUM_EPOCHS):
     pbar = tqdm(enumerate(train_loader), total=len(train_loader))
     for step, batch in pbar:
         hs = batch["hate_speech"][0]
+        gt = batch["ground_truth"][0]
 
-        # 1. Sample and generate K CNs
+        # generate K CNs
         gen_res = generate_responses_for_hs(
             hs,
             tokenizer=tokenizer,
             policy_model=policy_model,
             num_samples=NUM_SAMPLES_PER_PROMPT,
         )
-        responses = gen_res["responses_text"]      # len = K
-        sequences_ids = gen_res["sequences_ids"]   # [K, L]
+        responses = gen_res["responses_text"]   # len = K
+        sequences_ids = gen_res["sequences_ids"]   # [K=4, L]
         prompt_len = gen_res["prompt_len"]
 
-        # 2. evaluator computes K rewards
+        # use evaluator computes K rewards
         rewards_np = compute_sample_rewards(
             evaluator=evaluator,
-            hate_speech_list=[hs] * NUM_SAMPLES_PER_PROMPT,
+            hate_speech_list=[hs] * NUM_SAMPLES_PER_PROMPT,  # [hs, hs, hs, hs]
             cn_list=responses,
+            gt_list=[gt] * NUM_SAMPLES_PER_PROMPT,
         )
-        rewards = torch.tensor(
-            rewards_np, device=device, dtype=torch.float32
-        )  # [K]
 
-        # 3. calculate logprob & KL
+        rewards = torch.tensor(
+            rewards_np,
+            device=device,
+            dtype=torch.float32
+        )    # numpy->tensor, [K]
+
+        # cal logprob & KL
         stats = compute_logprobs_and_kl(
             sequences_ids=sequences_ids,
             prompt_len=prompt_len,
@@ -453,15 +530,15 @@ for epoch in range(NUM_EPOCHS):
             ref_model=ref_model,
         )
         seq_logprob = stats["seq_logprob"]  # [K]
-        kl_seq = stats["kl_seq"]            # [K]
+        kl_seq = stats["kl_seq"]  # [K]
 
-        # 4. calculate advantage & loss
+        # cal advantage & loss = pg_loss + kl_loss
         advantage = rewards - rewards.mean()
         pg_loss = -(advantage.detach() * seq_logprob).mean()
         kl_loss = KL_COEF * kl_seq.mean()
         loss = pg_loss + kl_loss
 
-        # 5. Gradient accumulation
+        # gradient accumulation
         loss = loss / GRAD_ACCUM_STEPS
         loss.backward()
 
@@ -478,18 +555,32 @@ for epoch in range(NUM_EPOCHS):
             f"reward_mean={rewards.mean().item():.4f} | kl={kl_seq.mean().item():.4f}"
         )
 
-    # 6. run a small portion of val at the end of each epoch
+    # val eval (small batch)
     val_reward = evaluate_on_val(
         val_loader, tokenizer, policy_model, evaluator, num_batches=50
     )
     print(f"[Epoch {epoch+1}] approx val reward (50 samples): {val_reward:.4f}")
 
-    # 7. save epoch checkpoint
+    # save epoch checkpoint
+    # epoch_dir = os.path.join(GRPO_OUTPUT_DIR, f"epoch_{epoch + 1}")
+    # os.makedirs(epoch_dir, exist_ok=True)
+    # policy_model.save_pretrained(epoch_dir)
+    # tokenizer.save_pretrained(epoch_dir)
+    # print(f"Saved checkpoint to: {epoch_dir}")
     epoch_dir = os.path.join(GRPO_OUTPUT_DIR, f"epoch_{epoch + 1}")
     os.makedirs(epoch_dir, exist_ok=True)
     policy_model.save_pretrained(epoch_dir)
     tokenizer.save_pretrained(epoch_dir)
+    save_training_state(
+        save_dir=epoch_dir,
+        epoch=epoch + 1,
+        global_step=global_step,
+        policy_model=policy_model,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+    )
     print(f"Saved checkpoint to: {epoch_dir}")
+
 
 # save grpo model
 os.makedirs(GRPO_OUTPUT_DIR, exist_ok=True)

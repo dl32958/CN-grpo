@@ -409,8 +409,8 @@ def evaluate_on_val(val_loader, tokenizer, policy_model, evaluator, num_batches 
 # checkpoint
 def save_training_state(save_dir, epoch, global_step, policy_model, optimizer, lr_scheduler):
     """
-    保存当前 epoch 结束时的训练状态到 save_dir/trainer_state.pt
-    epoch: 下次要从哪个 epoch 开始（这里通常传 epoch+1）
+    Save the training state at the end of current epoch to save_dir/trainer_state.pt
+    epoch: the epoch to start from next time (usually pass epoch+1 here)
     """
     state = {
         "epoch": epoch,
@@ -431,8 +431,8 @@ def save_training_state(save_dir, epoch, global_step, policy_model, optimizer, l
 
 def load_training_state_if_any(resume_dir, policy_model, optimizer, lr_scheduler,):
     """
-    如果提供了 resume_dir 且里面存在 trainer_state.pt，就加载；
-    否则返回 (start_epoch=0, global_step=0)，表示从头训练
+    If resume_dir is provided and trainer_state.pt exists in it, load the state;
+    Otherwise return (start_epoch=0, global_step=0), indicating training from scratch
     """
     if not resume_dir:
         print("[Resume] No resume_dir provided, start from scratch.")
@@ -444,25 +444,28 @@ def load_training_state_if_any(resume_dir, policy_model, optimizer, lr_scheduler
         return 0, 0
 
     print(f"[Resume] Loading training state from {state_path}")
-    ckpt = torch.load(state_path, map_location=device)
+    ckpt = torch.load(
+        state_path,
+        map_location=device,
+        weights_only=False,  # trust saved checkpoint
+    )
 
     policy_model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     lr_scheduler.load_state_dict(ckpt["scheduler_state_dict"])
 
-    rng = ckpt.get("rng_state", None)
-    if rng is not None:
-        random.setstate(rng["python"])
-        np.random.set_state(rng["numpy"])
-        torch.set_rng_state(rng["torch"])
-        torch.cuda.set_rng_state_all(rng["cuda"])
+    # rng = ckpt.get("rng_state", None)
+    # if rng is not None:
+    #     random.setstate(rng["python"])
+    #     np.random.set_state(rng["numpy"])
+    #     torch.set_rng_state(rng["torch"])
+    #     torch.cuda.set_rng_state_all(rng["cuda"])
 
     start_epoch = ckpt.get("epoch", 0)
     global_step = ckpt.get("global_step", 0)
 
     print(f"[Resume] Next epoch index = {start_epoch}, global_step = {global_step}")
     return start_epoch, global_step
-
 
 
 # ============= Train Loop ============
@@ -561,12 +564,6 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     )
     print(f"[Epoch {epoch+1}] approx val reward (50 samples): {val_reward:.4f}")
 
-    # save epoch checkpoint
-    # epoch_dir = os.path.join(GRPO_OUTPUT_DIR, f"epoch_{epoch + 1}")
-    # os.makedirs(epoch_dir, exist_ok=True)
-    # policy_model.save_pretrained(epoch_dir)
-    # tokenizer.save_pretrained(epoch_dir)
-    # print(f"Saved checkpoint to: {epoch_dir}")
     epoch_dir = os.path.join(GRPO_OUTPUT_DIR, f"epoch_{epoch + 1}")
     os.makedirs(epoch_dir, exist_ok=True)
     policy_model.save_pretrained(epoch_dir)

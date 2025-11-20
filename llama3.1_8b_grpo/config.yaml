@@ -19,7 +19,7 @@ generation:
 
 evaluation:
   evaluator_path: "../evaluator.py"
-  cn_path: "results/cn-gen-20251119_1316.csv"
+  cn_path: "results/cn-gen-20251120_0233.csv"
   output_dir: "results"
 
 prompts:

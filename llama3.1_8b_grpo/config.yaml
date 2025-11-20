@@ -3,11 +3,11 @@ grpo:
   train_data_path: "../datasets/processed/cn_train.csv"
   val_data_path: "../datasets/processed/cn_val.csv"
   test_data_path: "../datasets/processed/cn_test.csv"
-  output_dir: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft-grpo"
+  output_dir: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft-grpo/v2"
   evaluator_path: "../evaluator.py"
 
 generation:
-  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft-grpo/epoch_3"
+  model_path: "/projects/insightx-lab/cn_grpo/models/Llama-3.1-8B-Instruct-sft-grpo/v2/epoch_1"
   test_data_path: "../datasets/processed/cn_test.csv"
   output_dir: "results"
 

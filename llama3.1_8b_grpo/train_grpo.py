@@ -59,11 +59,11 @@ from evaluator import (
 NUM_EPOCHS = 5
 # effective_batch_size = batch_size * K * grad_accum
 BATCH_SIZE = 1
-GRAD_ACCUM_STEPS = 16
+GRAD_ACCUM_STEPS = 8   # last 16
 NUM_SAMPLES_PER_PROMPT = 4  # K
 MAX_NEW_TOKENS = 128
-LEARNING_RATE = 5e-6
-KL_COEF = 0.02
+LEARNING_RATE = 1e-5   # last 5e-6
+KL_COEF = 0.005    # last 0.02
 WARMUP_RATIO = 0.05
 
 GEN_TEMP = 0.7
@@ -537,6 +537,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
         # cal advantage & loss = pg_loss + kl_loss
         advantage = rewards - rewards.mean()
+        
+        # 标准化
+        advantage = advantage / (advantage.std() + 1e-8)
+        # 裁剪极端值
+        advantage = advantage.clamp(-5, 5)
+
         pg_loss = -(advantage.detach() * seq_logprob).mean()
         kl_loss = KL_COEF * kl_seq.mean()
         loss = pg_loss + kl_loss
